@@ -19,21 +19,23 @@ from django.core.management import execute_from_command_line
 from django.template.defaulttags import register
 from markdown import markdown
 from urllib3 import disable_warnings
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse
 
 import hexoweb.libs.i18n
 from core.qexoSettings import ALL_SETTINGS
 from core.qexoSettings import QEXO_VERSION, QEXO_STATIC, VDITOR_LANGUAGES
+from core.settings import DATABASES
 from hexoweb.libs.elevator import elevator
 from hexoweb.libs.onepush import notify
 from hexoweb.libs.platforms import get_provider
 from hexoweb.libs.i18n import get_language
-from .models import Cache, SettingModel, FriendModel, NotificationModel, CustomModel, StatisticUV, StatisticPV, ImageModel, TalkModel, \
-    PostModel
+from .models import Cache, SettingModel, FriendModel, NotificationModel, CustomModel, StatisticUV, StatisticPV, \
+    ImageModel, TalkModel, PostModel
 
 disable_warnings()
 
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s(%(filename)s.%(funcName)s[line:%(lineno)d])',
+logging.basicConfig(level=logging.INFO,
+                    format='[%(asctime)s] %(levelname)s: %(message)s(%(filename)s.%(funcName)s[line:%(lineno)d])',
                     datefmt="%d/%b/%Y %H:%M:%S")
 
 
@@ -61,9 +63,17 @@ except Exception:
     _Language = get_language("zh_CN").default
 
 
+def Language():
+    try:
+        return _Language
+    except Exception:
+        logging.error(gettext("ERROR_GETTING_PROVIDER") + ": " + gettext("RETRY"))
+        return update_language()
+
+
 @register.filter
 def gettext(value):
-    return _Language["data"].get(value, value)
+    return Language()["data"].get(value, value)
 
 
 def update_provider():
@@ -110,9 +120,13 @@ def excerpt(value, length):
 def get_cdn():
     cdn_prev = get_setting("CDN_PREV")
     if not cdn_prev:
-        save_setting("CDN_PREV", "https://unpkg.com/")
-        cdn_prev = "https://unpkg.com/"
-    return cdn_prev
+        cdn_prev = "https://registry.npmmirror.com/qexo-static/{version}/files/qexo"
+        for i in ALL_SETTINGS:
+            if i[0] == "CDN_PREV":
+                cdn_prev = i[1]
+                break
+        save_setting("CDN_PREV", cdn_prev)
+    return cdn_prev.format(version=QEXO_STATIC)
 
 
 # def get_cdnjs():
@@ -125,8 +139,8 @@ def get_cdn():
 
 # 获取用户自定义的样式配置
 def get_custom_config():
-    context = {"cdn_prev": get_cdn(), "QEXO_NAME": get_setting("QEXO_NAME"), "static_version": QEXO_STATIC,
-               "language": _Language.get("name", "zh_CN"), "vditor_languages": VDITOR_LANGUAGES,
+    context = {"cdn_prev": get_cdn(), "QEXO_NAME": get_setting("QEXO_NAME"),
+               "language": Language().get("name", "zh_CN"), "vditor_languages": VDITOR_LANGUAGES,
                "all_languages": hexoweb.libs.i18n.all_languages()}
     if not context["QEXO_NAME"]:
         save_setting('QEXO_NAME', 'Hexo' + gettext("CONSOLE"))
@@ -168,94 +182,64 @@ def update_caches(name, content, _type="json"):
     logging.info(gettext("REBUILD_CACHE_SUCCESS").format(name))
 
 
+def _filter_items_by_search(items, search_term):
+    """过滤列表项，只保留名称中包含搜索词的项目"""
+    if not search_term:
+        return items
+
+    filtered_items = []
+    for item in items:
+        if search_term.upper() in item["name"].upper():
+            filtered_items.append(item)
+    return filtered_items
+
+
+def _get_cached_or_fresh_data(cache_name, provider_method, search_term=None):
+    """从缓存获取数据或通过provider获取新数据"""
+    # 检查是否有现有缓存
+    old_cache = Cache.objects.filter(name=cache_name)
+
+    # 如果没有缓存或需要搜索，获取完整结果
+    if not old_cache.count() or search_term:
+        try:
+            if old_cache.count():
+                # 有缓存但需要搜索，先尝试从缓存过滤
+                cached_data = json.loads(old_cache.first().content)
+                filtered_data = _filter_items_by_search(cached_data, search_term)
+                update_caches(f"{cache_name}.{search_term}", filtered_data)
+                return filtered_data
+        except Exception:
+            pass
+
+        # 获取新数据
+        results = provider_method()
+        update_caches(cache_name, results)
+
+        if search_term:
+            filtered_results = _filter_items_by_search(results, search_term)
+            update_caches(f"{cache_name}.{search_term}", filtered_results)
+            return filtered_results
+        return results
+
+    # 直接返回缓存
+    try:
+        return json.loads(old_cache.first().content)
+    except Exception:
+        results = provider_method()
+        update_caches(cache_name, results)
+        return results
+
+
 def update_posts_cache(s=None):
-    if s:
-        old_cache = Cache.objects.filter(name="posts")
-        if old_cache.count():
-            posts = json.loads(old_cache.first().content)
-            i = 0
-            while i < len(posts):
-                if s.upper() not in posts[i]["name"].upper():
-                    del posts[i]
-                    i -= 1
-                i += 1
-            cache_name = "posts." + str(s)
-            update_caches(cache_name, posts)
-            return posts
-    else:
-        old_cache = False
-    posts = Provider().get_posts()
-    if s:
-        if not old_cache.count():
-            update_caches("posts", posts)
-        i = 0
-        while i < len(posts):
-            if s.upper() not in posts[i]["name"].upper():
-                del posts[i]
-                i -= 1
-            i += 1
-    if s:
-        cache_name = "posts." + str(s)
-    else:
-        cache_name = "posts"
-    update_caches(cache_name, posts)
-    return posts
+    return _get_cached_or_fresh_data("posts", Provider().get_posts, s)
 
 
 def update_pages_cache(s=None):
-    if s:
-        old_cache = Cache.objects.filter(name="pages")
-        if old_cache.count():
-            posts = json.loads(old_cache.first().content)
-            i = 0
-            while i < len(posts):
-                if s.upper() not in posts[i]["name"].upper():
-                    del posts[i]
-                    i -= 1
-                i += 1
-            cache_name = "pages." + str(s)
-            update_caches(cache_name, posts)
-            return posts
-    results = Provider().get_pages()
-    update_caches("pages", results)
-    if not s:
-        return results
-    i = 0
-    while i < len(results):
-        if s.upper() not in results[i]["name"].upper():
-            del results[i]
-            i -= 1
-        i += 1
-    update_caches("pages." + str(s), results)
-    return results
+    return _get_cached_or_fresh_data("pages", Provider().get_pages, s)
 
 
 def update_configs_cache(s=None):
-    if s:
-        old_cache = Cache.objects.filter(name="configs")
-        if old_cache.count():
-            posts = json.loads(old_cache.first().content)
-            i = 0
-            while i < len(posts):
-                if s.upper() not in posts[i]["name"].upper():
-                    del posts[i]
-                    i -= 1
-                i += 1
-            cache_name = "configs." + str(s)
-            update_caches(cache_name, posts)
-            return posts
-    results = Provider().get_configs()
-    update_caches("configs", results)
-    if not s:
-        return results
-    i = 0
-    while i < len(results):
-        if s.upper() not in results[i]["name"].upper():
-            del results[i]
-            i -= 1
-        i += 1
-    update_caches("configs." + str(s), results)
-    return results
+    return _get_cached_or_fresh_data("configs", Provider().get_configs, s)
 
 
 def delete_all_caches():
@@ -352,12 +336,25 @@ def check_if_api_auth(request):
         return True
     logging.info(
         request.path + ":" + gettext("API_VERIFY_FAILED").format(
-            request.META['HTTP_X_FORWARDED_FOR'] if 'HTTP_X_FORWARDED_FOR' in request.META.keys() else request.META['REMOTE_ADDR']))
+            request.META['HTTP_X_FORWARDED_FOR'] if 'HTTP_X_FORWARDED_FOR' in request.META.keys() else request.META[
+                'REMOTE_ADDR']))
     return False
 
 
 def check_if_vercel():
-    return True if os.environ.get("VERCEL") or get_setting("FORCE_VERCEL") else False
+    if os.environ.get("VERCEL"):
+        return True
+    if get_setting("FORCE_VERCEL"):
+        return True
+    return False
+
+
+def check_if_docker():
+    if os.environ.get("DOCKER"):
+        return True
+    if get_setting("FORCE_DOCKER"):
+        return True
+    return False
 
 
 def get_crc16(x, _hex=False):
@@ -538,14 +535,15 @@ def VercelOnekeyUpdate(url):
 def copy_all_files(src_dir, dst_dir):
     if not os.path.exists(dst_dir):
         os.makedirs(dst_dir)
-    if os.path.exists(src_dir):
-        for file in os.listdir(src_dir):
-            file_path = os.path.join(src_dir, file)
-            dst_path = os.path.join(dst_dir, file)
-            if os.path.isfile(os.path.join(src_dir, file)):
-                shutil.copyfile(file_path, dst_path)
-            else:
-                shutil.copytree(file_path, dst_path)
+    for file in os.listdir(src_dir):
+        file_path = os.path.join(src_dir, file)
+        dst_path = os.path.join(dst_dir, file)
+        if os.path.exists(dst_path):
+            continue
+        if os.path.isfile(os.path.join(src_dir, file)):
+            shutil.copyfile(file_path, dst_path)
+        else:
+            shutil.copytree(file_path, dst_path)
 
 
 def pip_main(args):
@@ -562,11 +560,13 @@ def pip_main(args):
 
 
 def LocalOnekeyUpdate(url):
+    import threading
     logging.info(gettext("START_LOCAL_UPDATE"))
     Path = os.path.abspath("")
     tmpPath = os.path.abspath("./_tmp")
-    if not os.path.exists(tmpPath):
-        os.mkdir(tmpPath)
+    if os.path.exists(tmpPath):
+        shutil.rmtree(tmpPath)
+    os.mkdir(tmpPath)
     _tarfile = tmpPath + '/github.tar.gz'
     with open(_tarfile, "wb") as file:
         file.write(requests.get(url).content)
@@ -589,23 +589,36 @@ def LocalOnekeyUpdate(url):
                 pass
     logging.info(gettext("START_COPY"))
     copy_all_files(outPath, Path)
+    os.chmod(Path + "/entrypoint.sh", 0o755)
     logging.info(gettext("DEL_TMP"))
     shutil.rmtree(tmpPath)
     logging.info(gettext("UPDATE_LIB"))
-    pip_main(['install', '-r', 'requirements.txt'])
+    if check_if_docker():
+        pip_main(['install', '-r', 'requirements-slim.txt'])
+    else:
+        pip_main(['install', '-r', 'requirements.txt'])
     logging.info(gettext("MIGRATE_DB"))
     execute_from_command_line(['manage.py', 'makemigrations'])
     execute_from_command_line(['manage.py', 'migrate'])
     logging.info(gettext("LOCAL_UPDATE_SUCCESS"))
-    import threading
     t = threading.Thread(target=lambda: rerun(5))
     t.start()
     return {"status": True, "msg": gettext("UPDATE_SUCCESS")}
 
 
+def is_runserver():
+    import sys
+    current_command = sys.argv[1] if len(sys.argv) > 1 else ''
+    return current_command == 'runserver'
+
+
 def rerun(wait):
     sleep(wait)
-    os._exit(3)
+    if is_runserver():
+        os._exit(3)
+    else:
+        import signal
+        os.kill(os.getpid(), signal.SIGHUP)
 
 
 def CreateNotification(label, content, now):
@@ -755,15 +768,18 @@ def get_post_details(article, safe=True):
     try:
         if article[:3] == "---":
             front_matter = re.search(r"---([\s\S]*?)---", article, flags=0).group()[3:-4]
-            front_matter = front_matter.replace("{{ date }}", dateformat).replace("{{ abbrlink }}", abbrlink).replace("{{ slug }}",
-                                                                                                                      abbrlink).replace("{",
-                                                                                                                                        "").replace(
+            front_matter = front_matter.replace("{{ date }}", dateformat).replace("{{ abbrlink }}", abbrlink).replace(
+                "{{ slug }}",
+                abbrlink).replace("{",
+                                  "").replace(
                 "}", "")
             front_matter = yaml.safe_load(front_matter)
         elif article[:3] == ";;;":
             front_matter = json.loads("{{{}}}".format(
-                re.search(r";;;([\s\S]*?);;;", article, flags=0).group()[3:-4].replace("{{ date }}", dateformat).replace("{{ abbrlink }}",
-                                                                                                                         abbrlink).replace(
+                re.search(r";;;([\s\S]*?);;;", article, flags=0).group()[3:-4].replace("{{ date }}",
+                                                                                       dateformat).replace(
+                    "{{ abbrlink }}",
+                    abbrlink).replace(
                     "{{ slug }}", abbrlink)))
         else:
             front_matter = {}
@@ -784,202 +800,263 @@ def get_post_details(article, safe=True):
             elif type(front_matter.get(key)) == date:
                 front_matter[key] = front_matter[key].isoformat()
         if safe:
-            passage = repr(re.search(r"[;-][;-][;-]([\s\S]*)", article[3:], flags=0).group()[3:]).replace("<", "\\<").replace(">",
-                                                                                                                              "\\>").replace(
+            passage = repr(re.search(r"[;-][;-][;-]([\s\S]*)", article[3:], flags=0).group()[3:]).replace("<",
+                                                                                                          "\\<").replace(
+                ">",
+                "\\>").replace(
                 "!", "\\!")
         else:
             passage = re.search(r"[;-][;-][;-]([\s\S]*)", article[3:], flags=0).group()[3:]
     return front_matter, passage
 
 
+def _export_model_data(model_class, field_mapping=None):
+    """
+    通用导出函数，从数据库获取指定模型的所有记录并转换为字典列表
+
+    Args:
+        model_class: 要导出的模型类
+        field_mapping: 字段映射函数，用于自定义每条记录如何转换为字典
+
+    Returns:
+        包含所有记录数据的字典列表
+    """
+    all_items = model_class.objects.all()
+    result = []
+
+    for item in all_items:
+        if field_mapping:
+            result.append(field_mapping(item))
+        else:
+            # 默认映射逻辑，获取所有字段
+            item_dict = {}
+            for field in item._meta.fields:
+                field_name = field.name
+                item_dict[field_name] = getattr(item, field_name)
+            result.append(item_dict)
+
+    return result
+
+
 def export_settings():
-    all_settings = SettingModel.objects.all()
-    settings = list()
-    for setting in all_settings:
-        settings.append({"name": setting.name, "content": setting.content})
-    return settings
+    return _export_model_data(
+        SettingModel,
+        lambda item: {"name": item.name, "content": item.content}
+    )
 
 
 def export_images():
-    all_settings = ImageModel.objects.all()
-    settings = list()
-    for setting in all_settings:
-        settings.append({"name": setting.name, "url": setting.url, "size": setting.size, "date": setting.date, "type": setting.type,
-                         "deleteConfig": setting.deleteConfig})
-    return settings
+    return _export_model_data(
+        ImageModel,
+        lambda item: {
+            "name": item.name,
+            "url": item.url,
+            "size": item.size,
+            "date": item.date,
+            "type": item.type,
+            "deleteConfig": item.deleteConfig
+        }
+    )
 
 
 def export_friends():
-    all_ = FriendModel.objects.all()
-    ss = list()
-    for s in all_:
-        ss.append({"name": s.name, "url": s.url, "imageUrl": s.imageUrl, "time": s.time, "description": s.description, "status": s.status})
-    return ss
+    return _export_model_data(
+        FriendModel,
+        lambda item: {
+            "name": item.name,
+            "url": item.url,
+            "imageUrl": item.imageUrl,
+            "time": item.time,
+            "description": item.description,
+            "status": item.status
+        }
+    )
 
 
 def export_notifications():
-    all_ = NotificationModel.objects.all()
-    ss = list()
-    for s in all_:
-        ss.append({"time": s.time, "label": s.label, "content": s.content})
-    return ss
+    return _export_model_data(
+        NotificationModel,
+        lambda item: {"time": item.time, "label": item.label, "content": item.content}
+    )
 
 
 def export_customs():
-    all_ = CustomModel.objects.all()
-    ss = list()
-    for s in all_:
-        ss.append({"name": s.name, "content": s.content})
-    return ss
+    return _export_model_data(
+        CustomModel,
+        lambda item: {"name": item.name, "content": item.content}
+    )
 
 
 def export_uv():
-    all_ = StatisticUV.objects.all()
-    ss = list()
-    for s in all_:
-        ss.append({"ip": s.ip})
-    return ss
+    return _export_model_data(
+        StatisticUV,
+        lambda item: {"ip": item.ip}
+    )
 
 
 def export_pv():
-    all_ = StatisticPV.objects.all()
-    ss = list()
-    for s in all_:
-        ss.append({"url": s.url, "number": s.number})
-    return ss
+    return _export_model_data(
+        StatisticPV,
+        lambda item: {"url": item.url, "number": item.number}
+    )
 
 
 def export_talks():
-    all_ = TalkModel.objects.all()
-    ss = list()
-    for s in all_:
-        ss.append({"content": s.content, "tags": s.tags, "time": s.time, "like": s.like})
-    return ss
+    return _export_model_data(
+        TalkModel,
+        lambda item: {"content": item.content, "tags": item.tags, "time": item.time, "like": item.like}
+    )
 
 
 def export_posts():
-    all_ = PostModel.objects.all()
-    ss = list()
-    for s in all_:
-        ss.append(
-            {"title": s.title, "path": s.path, "status": s.status, "front_matter": s.front_matter, "date": s.date, "filename": s.filename})
-    return ss
+    return _export_model_data(
+        PostModel,
+        lambda item: {
+            "title": item.title,
+            "path": item.path,
+            "status": item.status,
+            "front_matter": item.front_matter,
+            "date": item.date,
+            "filename": item.filename
+        }
+    )
+
+
+def _bulk_import(model_class, data, field_mapping_func, model_name):
+    """通用批量导入函数"""
+    try:
+        # 删除现有数据
+        model_class.objects.all().delete()
+
+        # 批量创建新对象
+        objects = [field_mapping_func(item) for item in data]
+        model_class.objects.bulk_create(objects)
+
+        logging.info(gettext("IMPORT_SUCCESS").format(model_name))
+        return True
+    except Exception as e:
+        logging.error(gettext("IMPORT_FAILED").format(model_name, str(e)))
+        return False
 
 
 def import_settings(ss):
-    for s in ss:
-        save_setting(s["name"], s["content"])
-    return True
+    return _bulk_import(
+        SettingModel,
+        ss,
+        lambda s: SettingModel(
+            name=s["name"],
+            content=s["content"]
+        ),
+        "设置"
+    )
 
 
 def import_images(ss):
-    _all = ImageModel.objects.all()
-    for i in _all:
-        i.delete()
-    for s in ss:
-        image = ImageModel()
-        image.name = s["name"]
-        image.url = s["url"]
-        image.size = s["size"]
-        image.date = s["date"]
-        image.type = s["type"]
-        image.deleteConfig = s["deleteConfig"]
-        image.save()
-    return True
+    return _bulk_import(
+        ImageModel,
+        ss,
+        lambda s: ImageModel(
+            name=s["name"],
+            url=s["url"],
+            size=s["size"],
+            date=s["date"],
+            type=s["type"],
+            deleteConfig=s["deleteConfig"]
+        ),
+        "图片"
+    )
 
 
 def import_friends(ss):
-    _all = FriendModel.objects.all()
-    for i in _all:
-        i.delete()
-    for s in ss:
-        friend = FriendModel()
-        friend.name = s["name"]
-        friend.url = s["url"]
-        friend.imageUrl = s["imageUrl"]
-        friend.time = s["time"]
-        friend.description = s["description"]
-        friend.status = s["status"]
-        friend.save()
-    return True
+    return _bulk_import(
+        FriendModel,
+        ss,
+        lambda s: FriendModel(
+            name=s["name"],
+            url=s["url"],
+            imageUrl=s["imageUrl"],
+            time=s["time"],
+            description=s["description"],
+            status=s["status"]
+        ),
+        "友链"
+    )
 
 
 def import_notifications(ss):
-    _all = NotificationModel.objects.all()
-    for i in _all:
-        i.delete()
-    for s in ss:
-        notification = NotificationModel()
-        notification.time = s["time"]
-        notification.label = s["label"]
-        notification.content = s["content"]
-        notification.save()
-    return True
+    return _bulk_import(
+        NotificationModel,
+        ss,
+        lambda s: NotificationModel(
+            time=s["time"],
+            label=s["label"],
+            content=s["content"]
+        ),
+        "通知"
+    )
 
 
 def import_custom(ss):
-    _all = CustomModel.objects.all()
-    for i in _all:
-        i.delete()
-    for s in ss:
-        custom = CustomModel()
-        custom.name = s["name"]
-        custom.content = s["content"]
-        custom.save()
-    return True
+    return _bulk_import(
+        CustomModel,
+        ss,
+        lambda s: CustomModel(
+            name=s["name"],
+            content=s["content"]
+        ),
+        "自定义"
+    )
 
 
 def import_uv(ss):
-    _all = StatisticUV.objects.all()
-    for i in _all:
-        i.delete()
-    for s in ss:
-        uv = StatisticUV()
-        uv.ip = s["ip"]
-        uv.save()
-    return True
+    return _bulk_import(
+        StatisticUV,
+        ss,
+        lambda s: StatisticUV(ip=s["ip"]),
+        "UV统计"
+    )
 
 
 def import_pv(ss):
-    _all = StatisticPV.objects.all()
-    for i in _all:
-        i.delete()
-    for s in ss:
-        pv = StatisticPV()
-        pv.url = s["url"]
-        pv.number = s["number"]
-        pv.save()
-    return True
+    return _bulk_import(
+        StatisticPV,
+        ss,
+        lambda s: StatisticPV(
+            url=s["url"],
+            number=s["number"]
+        ),
+        "PV统计"
+    )
 
 
 def import_talks(ss):
-    _all = TalkModel.objects.all()
-    for i in _all:
-        i.delete()
-    for s in ss:
-        talk = TalkModel()
-        talk.content = s["content"]
-        talk.tags = s["tags"]
-        talk.time = s["time"]
-        talk.like = s["like"]
-        talk.save()
-    return True
+    return _bulk_import(
+        TalkModel,
+        ss,
+        lambda s: TalkModel(
+            content=s["content"],
+            tags=s["tags"],
+            time=s["time"],
+            like=s["like"]
+        ),
+        "说说"
+    )
 
 
 def import_posts(ss):
-    _all = PostModel.objects.all()
-    for i in _all:
-        i.delete()
-    for s in ss:
-        post = PostModel()
-        post.title = s["title"]
-        post.path = s["path"]
-        post.status = s["status"]
-        post.front_matter = s["front_matter"]
-        post.date = s["date"]
-        post.filename = s["filename"]
-        post.save()
-    return True
+    return _bulk_import(
+        PostModel,
+        ss,
+        lambda s: PostModel(
+            title=s["title"],
+            path=s["path"],
+            status=s["status"],
+            front_matter=s["front_matter"],
+            date=s["date"],
+            filename=s["filename"]
+        ),
+        "文章"
+    )
 
 
 def excerpt_post(content, length, mark=True):
@@ -1058,14 +1135,13 @@ def convert_to_kb_mb_gb(size_in_bytes):
 
 
 def get_domain_and_path(url):
-    if url[:7] == "http://":
-        url = url[7:]
-    elif url[:8] == "https://":
-        url = url[8:]
-    domain = url.split("/")[0]
-    # 过滤参数
-    url = url.split("?")[0].split("#")[0]
-    return domain, url
+    parsed = urlparse(url if "://" in url else "//" + url)
+    domain = parsed.netloc
+    path = domain + parsed.path if domain else parsed.path
+    return domain, path
+
+def get_db_config():
+    return DATABASES["default"]["ENGINE"]
 
 
 # print(" ......................阿弥陀佛......................\n" +
@@ -1090,14 +1166,16 @@ def get_domain_and_path(url):
 #       "                                                    \n" +
 #       "....................佛祖保佑 ,永无BUG...................")
 
+import platform as pf
+
 print("           _               _ \n" +
       "     /\\   | |             | |\n" +
       "    /  \\  | |__  _   _  __| |_   _ \n" +
       "   / /\\ \\ | |_ \\| | | |/ _| | | | |\n" +
       "  / ____ \\| |_) | |_| | (_| | |_| |\n" +
       " /_/    \\_\\____/ \\____|\\____|\\____|")
-
-print(gettext("CURRENT_ENV") + ": " + ("Vercel" if check_if_vercel() else gettext("LOCAL")))
+print(gettext("CURRENT_ENV") + ": " + ("Vercel" if check_if_vercel() else gettext("LOCAL")) + " / " + (
+    "Docker" if check_if_docker() else pf.system()) + " / Qexo " + QEXO_VERSION + " / Python " + pf.python_version() + " / " + get_db_config())
 
 if check_if_vercel():
     logging.info = logging.warn

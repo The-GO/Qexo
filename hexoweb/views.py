@@ -20,20 +20,20 @@ from .api import *
 
 
 def page_404(request, exception):
-    return render(request, 'home/page-404.html', {"cdn_prev": "https://unpkg.com/"})
+    return render(request, 'home/page-404.html', {"cdn_prev": "https://registry.npmmirror.com/qexo-static/{version}/files/qexo".format(version=QEXO_STATIC)})
 
 
 def page_403(request, exception):
-    return render(request, 'home/page-403.html', {"cdn_prev": "https://unpkg.com/"})
+    return render(request, 'home/page-403.html', {"cdn_prev": "https://registry.npmmirror.com/qexo-static/{version}/files/qexo".format(version=QEXO_STATIC)})
 
 
 def page_500(request):
     try:
         return render(request, 'home/page-500.html',
-                      {"error": gettext("SYSTEM_ERROR"), "cdn_prev": "https://unpkg.com/"})
+                      {"error": gettext("SYSTEM_ERROR"), "cdn_prev": "https://registry.npmmirror.com/qexo-static/{version}/files/qexo".format(version=QEXO_STATIC)})
     except Exception as e:
         return render(request, 'home/page-500.html',
-                      {"error": repr(e), "cdn_prev": "https://unpkg.com/"})
+                      {"error": repr(e), "cdn_prev": "https://registry.npmmirror.com/qexo-static/{version}/files/qexo".format(version=QEXO_STATIC)})
 
 
 def login_view(request):
@@ -315,12 +315,6 @@ def migrate_view(request):
     if not request.user.is_staff:
         logging.info(gettext("USER_IS_NOT_STAFF").format(request.user.username, request.path))
         return page_403(request, gettext("NO_PERMISSION"))
-    try:
-        if int(get_setting("INIT")) <= 5:
-            return redirect("/init/")
-    except Exception:
-        logging.info(gettext("NOT_INIT"))
-        return redirect("/init/")
     context = {}
     if request.method == "POST":
         try:
@@ -565,6 +559,7 @@ def pages(request):
                 posts[item]["size"] = convert_to_kb_mb_gb(posts[item]["size"])
             context["all_posts"] = json.dumps(posts)
             context["post_number"] = len(posts)
+            context["new_dir"] = Provider().config["posts"]["save_path"]
             context["page_number"] = ceil(context["post_number"] / 15)
             context["search"] = search
         elif "pages" in load_template:
@@ -585,6 +580,7 @@ def pages(request):
                     posts = update_pages_cache(search)
             for item in range(len(posts)):
                 posts[item]["size"] = convert_to_kb_mb_gb(posts[item]["size"])
+            context["new_dir"] = Provider().config["pages"]["save_path"]
             context["posts"] = json.dumps(posts)
             context["post_number"] = len(posts)
             context["page_number"] = ceil(context["post_number"] / 15)
@@ -622,17 +618,21 @@ def pages(request):
             talks = TalkModel.objects.all()
             for i in talks:
                 t = json.loads(i.like)
+                try:
+                    strtime = strftime("%Y-%m-%d %H:%M:%S", localtime(int(i.time)))
+                except Exception:
+                    strtime = "undefined"
                 if not search:
                     posts.append({"content": excerpt_post(i.content, 20, mark=False),
                                   "tags": ', '.join(json.loads(i.tags)),
-                                  "time": strftime("%Y-%m-%d %H:%M:%S", localtime(int(i.time))),
+                                  "time": strtime,
                                   "like": len(t) if t else 0,
                                   "id": i.id.hex})
                 else:
                     if search.upper() in i.content.upper() or search in i.tags.upper() or search in i.values.upper():
                         posts.append({"content": excerpt_post(i.content, 20, mark=False),
                                       "tags": ', '.join(json.loads(i.tags)),
-                                      "time": strftime("%Y-%m-%d %H:%M:%S", localtime(int(i.time))),
+                                      "time": strtime,
                                       "like": len(t) if t else 0,
                                       "id": i.id.hex})
             context["posts"] = json.dumps(sorted(posts, key=lambda x: x["time"], reverse=True))
@@ -736,6 +736,8 @@ def pages(request):
                     context["all_image_hosts"][provider] = params
                 # CDNs
                 context["ALL_CDN"] = json.loads(get_setting("ALL_CDN_PREV"))
+                context["NOW_CDN"] = get_setting("CDN_PREV")
+                context["static_version"] = QEXO_STATIC
                 # 更新通道
                 context["ALL_UPDATES"] = json.loads(get_setting("ALL_UPDATES"))
                 context["ALL_PLATFORM_CONFIGS"] = platform_configs()
